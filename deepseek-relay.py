@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import re
 import threading
@@ -14,7 +15,29 @@ CDP_URL = "http://127.0.0.1:9222"
 HOST = "127.0.0.1"
 PORT = 8080
 
+# ==================================================
+# НАСТРОЙКИ СУММАРИЗАЦИИ И ОБРЕЗКИ
+# ==================================================
+
+# Порог промпта в символах. Если превышает — запускается суммаризация.
+# Грубо: 40000 символов ≈ 10000 токенов.
+MAX_PROMPT_CHARS = 40000
+
+# Сколько последних сообщений всегда оставлять в живом виде.
+KEEP_RECENT_MESSAGES = 4
+
+# Максимум символов для одного tool-результата (содержимое файла и т.п.).
+MAX_TOOL_RESULT_CHARS = 4000
+
+# Сколько символов оставлять в начале и конце обрезанного tool-результата.
+TOOL_RESULT_HEAD = 3000
+TOOL_RESULT_TAIL = 800
+
 browser_lock = threading.Lock()
+
+# Кеш резюме: ключ — хеш старой истории, значение — текст резюме.
+_summary_cache = {}
+_summary_cache_lock = threading.Lock()
 
 
 def command_counter():
@@ -460,7 +483,6 @@ def get_deepseek_answer(ws, counter, timeout=120):
                 "DeepSeek completion пришёл, но текст ответа не найден"
             )
 
-        # DeepSeek Web иногда приклеивает служебные маркеры к тексту ответа.
         answer = answer.rstrip()
 
         for marker in ("FINISHED", "FINISH", "[DONE]", "STOP"):
@@ -710,6 +732,234 @@ Available tools:
     )
 
 
+def truncate_tool_results(messages):
+    """Обрезает длинные tool-результаты, чтобы не раздувать промпт."""
+    result = []
+    truncated_count = 0
+    total_saved = 0
+
+    for message in messages:
+        if not isinstance(message, dict):
+            result.append(message)
+            continue
+
+        role = message.get("role")
+        content = message.get("content")
+
+        if role == "tool" and isinstance(content, str):
+            if len(content) > MAX_TOOL_RESULT_CHARS:
+                original_len = len(content)
+                head = content[:TOOL_RESULT_HEAD]
+                tail = content[-TOOL_RESULT_TAIL:]
+                omitted = original_len - TOOL_RESULT_HEAD - TOOL_RESULT_TAIL
+
+                new_content = (
+                    head
+                    + "\n\n... [обрезано "
+                    + str(omitted)
+                    + " символов] ...\n\n"
+                    + tail
+                )
+
+                new_message = dict(message)
+                new_message["content"] = new_content
+                result.append(new_message)
+
+                truncated_count += 1
+                total_saved += original_len - len(new_content)
+                continue
+
+        result.append(message)
+
+    if truncated_count:
+        print(
+            "Truncated %d tool result(s), saved %d chars"
+            % (truncated_count, total_saved)
+        )
+
+    return result
+
+
+def _messages_to_text(messages):
+    """Преобразует список сообщений в читаемый текст для суммаризации."""
+    parts = []
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+
+        role = message.get("role", "user")
+        content = normalize_content(message.get("content", ""))
+
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            content += "\n[вызваны инструменты: " + ", ".join(
+                tc.get("function", {}).get("name", "?")
+                for tc in tool_calls
+                if isinstance(tc, dict)
+            ) + "]"
+
+        if len(content) > 8000:
+            content = content[:6000] + "\n...[обрезано]...\n" + content[-1500:]
+
+        parts.append("%s: %s" % (str(role).upper(), content))
+
+    return "\n\n".join(parts)
+
+
+def _history_hash(messages):
+    """Стабильный хеш истории для кеша резюме."""
+    text = _messages_to_text(messages)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def summarize_history(old_messages):
+    """Сжимает старую часть истории в резюме через DeepSeek."""
+    if not old_messages:
+        return ""
+
+    key = _history_hash(old_messages)
+
+    with _summary_cache_lock:
+        cached = _summary_cache.get(key)
+        if cached:
+            print("Using cached summary (key: %s...)" % key[:12])
+            return cached
+
+    history_text = _messages_to_text(old_messages)
+
+    if len(history_text) > 50000:
+        history_text = (
+            history_text[:35000]
+            + "\n\n...[середина обрезана]...\n\n"
+            + history_text[-15000:]
+        )
+
+    summary_prompt = (
+        "Ты — ассистент, который сжимает историю работы кодинг-агента "
+        "в краткое резюме. Прочитай историю ниже и составь резюме "
+        "на русском языке, до 500 слов.\n\n"
+        "Сохрани в резюме:\n"
+        "- что пользователь изначально попросил\n"
+        "- какие файлы читались, создавались, редактировались (с путями)\n"
+        "- какие команды выполнялись и их результат\n"
+        "- какие решения и подходы были выбраны\n"
+        "- что уже сделано, что осталось сделать\n"
+        "- важные детали: имена переменных, ключевые ошибки, договорённости\n\n"
+        "Не пиши вступлений вроде \"вот резюме\". Начинай сразу с сути.\n\n"
+        "ИСТОРИЯ:\n\n"
+        + history_text
+    )
+
+    print()
+    print("=" * 70)
+    print("SUMMARIZATION REQUEST")
+    print("=" * 70)
+    print("Old messages:", len(old_messages))
+    print("History text length:", len(history_text))
+    print("=" * 70)
+
+    summary = ask_deepseek(summary_prompt)
+
+    summary = summary.strip()
+
+    if len(summary) > 8000:
+        summary = summary[:8000] + "\n...[резюме обрезано]..."
+
+    print("SUMMARY CREATED:", len(summary), "chars")
+
+    with _summary_cache_lock:
+        _summary_cache[key] = summary
+
+        if len(_summary_cache) > 20:
+            oldest = next(iter(_summary_cache))
+            _summary_cache.pop(oldest, None)
+
+    return summary
+
+
+def prepare_messages(messages, tools):
+    """
+    Готовит сообщения к отправке:
+    - обрезает tool-результаты,
+    - при переполнении — суммаризирует старые сообщения.
+    """
+    if not isinstance(messages, list) or not messages:
+        return messages
+
+    messages = truncate_tool_results(messages)
+
+    prompt_without_summary = build_prompt(messages, tools)
+
+    if len(prompt_without_summary) <= MAX_PROMPT_CHARS:
+        print(
+            "Prompt size OK: %d / %d chars"
+            % (len(prompt_without_summary), MAX_PROMPT_CHARS)
+        )
+        return messages
+
+    print(
+        "Prompt too large: %d / %d chars, summarizing..."
+        % (len(prompt_without_summary), MAX_PROMPT_CHARS)
+    )
+
+    if len(messages) <= KEEP_RECENT_MESSAGES + 1:
+        print("Not enough messages to summarize, sending as-is")
+        return messages
+
+    system_msg = None
+    rest = messages
+
+    if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+        system_msg = messages[0]
+        rest = messages[1:]
+
+    old_messages = rest[:-KEEP_RECENT_MESSAGES] if len(rest) > KEEP_RECENT_MESSAGES else []
+    recent_messages = rest[-KEEP_RECENT_MESSAGES:] if len(rest) > KEEP_RECENT_MESSAGES else rest
+
+    if not old_messages:
+        print("No old messages to summarize")
+        return messages
+
+    try:
+        summary = summarize_history(old_messages)
+    except Exception as e:
+        print("[SUMMARY ERROR]", repr(e))
+        print("Falling back to simple truncation")
+        if system_msg:
+            return [system_msg] + recent_messages
+        return recent_messages
+
+    if not summary:
+        print("Empty summary, falling back to truncation")
+        if system_msg:
+            return [system_msg] + recent_messages
+        return recent_messages
+
+    summary_message = {
+        "role": "user",
+        "content": (
+            "[РЕЗЮМЕ ПРЕДЫДУЩЕЙ РАБОТЫ]\n\n"
+            + summary
+            + "\n\n[КОНЕЦ РЕЗЮМЕ. Продолжай работу с этого места.]"
+        ),
+    }
+
+    new_messages = []
+    if system_msg:
+        new_messages.append(system_msg)
+    new_messages.append(summary_message)
+    new_messages.extend(recent_messages)
+
+    new_prompt = build_prompt(new_messages, tools)
+    print(
+        "After summarization: %d chars (was %d)"
+        % (len(new_prompt), len(prompt_without_summary))
+    )
+
+    return new_messages
+
+
 def build_prompt(messages, tools):
     parts = []
 
@@ -720,7 +970,6 @@ def build_prompt(messages, tools):
         role = message.get("role", "user")
         content = normalize_content(message.get("content", ""))
 
-        # Preserve tool calls/results from the previous Cline turn.
         tool_calls = message.get("tool_calls")
         if isinstance(tool_calls, list) and tool_calls:
             content += "\nTOOL_CALLS:\n" + json.dumps(
@@ -782,7 +1031,6 @@ def _parse_json_object(text):
 
     stripped = text.strip()
 
-    # Remove optional markdown fences if DeepSeek adds them.
     if stripped.startswith("```") and stripped.endswith("```"):
         lines = stripped.splitlines()
 
@@ -797,7 +1045,6 @@ def _parse_json_object(text):
     if isinstance(obj, dict):
         return obj
 
-    # Fallback: вытащить JSON-объект с "tool_call"/"tool_calls".
     match = re.search(
         r'\{.*?"tool_calls?".*\}',
         stripped,
@@ -1062,7 +1309,6 @@ class Handler(BaseHTTPRequestHandler):
         prompt_len,
         include_usage,
     ):
-        """Эмулирует стриминг: отдаёт текст порциями по ~40 символов."""
         self.send_response(200)
         self.send_header(
             "Content-Type",
@@ -1310,6 +1556,8 @@ class Handler(BaseHTTPRequestHandler):
             print("stream:", stream)
             print("include_usage:", include_usage)
 
+            messages = prepare_messages(messages, tools)
+
             prompt = build_prompt(
                 messages,
                 tools,
@@ -1453,6 +1701,10 @@ def main():
     print("Health:    http://127.0.0.1:%d/health" % PORT)
     print("Models:    http://127.0.0.1:%d/v1/models" % PORT)
     print("Chrome CDP:", CDP_URL)
+    print("=" * 70)
+    print("Summarization: max prompt =", MAX_PROMPT_CHARS, "chars")
+    print("Keep recent messages:", KEEP_RECENT_MESSAGES)
+    print("Max tool result:", MAX_TOOL_RESULT_CHARS, "chars")
     print("=" * 70)
 
     server = ThreadingHTTPServer(
