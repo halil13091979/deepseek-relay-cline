@@ -21,17 +21,17 @@ PORT = 8080
 
 # Порог промпта в символах. Если превышает — запускается суммаризация.
 # Грубо: 40000 символов ≈ 10000 токенов.
-MAX_PROMPT_CHARS = 40000
+MAX_PROMPT_CHARS = 25000
 
 # Сколько последних сообщений всегда оставлять в живом виде.
 KEEP_RECENT_MESSAGES = 4
 
 # Максимум символов для одного tool-результата (содержимое файла и т.п.).
-MAX_TOOL_RESULT_CHARS = 4000
+MAX_TOOL_RESULT_CHARS = 2500
 
 # Сколько символов оставлять в начале и конце обрезанного tool-результата.
-TOOL_RESULT_HEAD = 3000
-TOOL_RESULT_TAIL = 800
+TOOL_RESULT_HEAD = 1800
+TOOL_RESULT_TAIL = 500
 
 browser_lock = threading.Lock()
 
