@@ -500,6 +500,7 @@ def ask_deepseek(prompt):
         ws = None
 
         try:
+            time.sleep(3)
             ws = cdp_connect()
             counter = command_counter()
 
