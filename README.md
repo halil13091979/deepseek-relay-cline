@@ -1,5 +1,476 @@
 # deepseek-relay-cline
 
+[English](#english) · [Русский](#русский)
+
+---
+
+<a name="english"></a>
+
+# English
+
+Local OpenAI-compatible relay that lets [Cline](https://github.com/cline/cline)
+in VS Code use **DeepSeek Web Chat** as a coding-agent backend through
+**Chrome DevTools Protocol** (CDP).
+
+Cline thinks it's talking to a normal OpenAI-compatible API and works in
+**Act mode**: reads files, runs commands, edits code, searches the project.
+On the other end is the DeepSeek web UI, which doesn't expose a public API.
+
+## Table of Contents
+
+- [Why](#why)
+- [How it works](#how-it-works)
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [First run](#first-run)
+- [Daily run](#daily-run)
+- [Cline setup](#cline-setup)
+- [Usage](#usage)
+- [Health checks](#health-checks)
+- [Where to find logs](#where-to-find-logs)
+- [Useful commands](#useful-commands)
+- [Troubleshooting](#troubleshooting)
+- [Updating the relay](#updating-the-relay)
+- [Project structure](#project-structure)
+- [Limitations](#limitations)
+- [Disclaimer](#disclaimer)
+- [License](#license)
+- [Credits](#credits)
+
+## Why
+
+DeepSeek Web Chat is a great model, but it doesn't provide a public API for
+use as a coding-agent backend. Cline, on the other hand, can work with any
+OpenAI-compatible endpoint.
+
+This relay bridges the gap:
+
+- accepts `/v1/chat/completions` from Cline,
+- forwards messages and the tool list to DeepSeek Web Chat via CDP,
+- extracts the response (streaming SSE, parsing),
+- if DeepSeek returns a tool call, converts it to OpenAI-compatible
+  `tool_calls` with `finish_reason: "tool_calls"`,
+- otherwise streams plain text,
+- receives tool results from Cline and sends them back to DeepSeek for
+  the next step.
+
+The result is a full agent loop:
+
+> **DeepSeek plans → Cline executes → result returns → DeepSeek plans the next step.**
+
+## How it works
+
+```
+┌─────────────────┐    HTTP/SSE    ┌──────────────────┐   WebSocket   ┌──────────────────┐
+│  Cline (VS Code)│ ─────────────► │  deepseek-relay  │ ────────────► │  Chrome + CDP    │
+│  Act mode       │ ◄───────────── │  127.0.0.1:8080  │ ◄──────────── │  chat.deepseek   │
+└─────────────────┘   tool_calls   └──────────────────┘   SSE + DOM   └──────────────────┘
+                            │                                                  ▲
+                            ▼                                                  │
+                    ┌──────────────────┐                                       │
+                    │  Files, commands │                                       │
+                    │  editor, search  │ ──────────────────────────────────────┘
+                    └──────────────────┘   (through Cline, not the relay)
+```
+
+Step by step:
+
+1. Cline sends an HTTP POST to `http://127.0.0.1:8080/v1/chat/completions`
+   with messages and the tool list in OpenAI format.
+2. The relay builds a text prompt and injects it into the `<textarea>` on
+   `chat.deepseek.com` via CDP.
+3. The relay clicks Send.
+4. DeepSeek processes the request and returns the answer via SSE.
+5. The relay listens to Network events, catches
+   `POST /api/v0/chat/completion`, and reads its response body.
+6. Parses SSE and assembles the text.
+7. If the text contains `{"tool_call": ...}` or `{"tool_calls": [...]}`,
+   converts it to an OpenAI-compatible response and sends it to Cline.
+8. Cline executes the tool and posts the result back to the relay.
+9. The relay appends the result to the prompt and sends it to DeepSeek again.
+10. The loop repeats until DeepSeek returns plain text without a tool call.
+
+The relay **does not execute** tools itself — Cline does. The relay only
+translates between OpenAI format and the DeepSeek Web text protocol.
+
+## Features
+
+- OpenAI-compatible endpoint `/v1/chat/completions`
+- `/v1/models` and `/health` endpoints
+- CORS and OPTIONS for VS Code
+- SSE streaming of responses back to Cline
+- OpenAI-format tool call support
+- Parallel tool calls (multiple in one response)
+- Tool name fallback (if the model "invented" a name)
+- Usage chunk (token estimate) when the client asks
+- Resilience to client disconnects
+- Full-cycle logging: Cline request → prompt → DeepSeek answer → tool call
+
+## Requirements
+
+| Component         | Version / note                          |
+|-------------------|-----------------------------------------|
+| OS                | Windows 10 / 11                         |
+| Python            | 3.10 or newer                           |
+| Google Chrome     | Any recent version                      |
+| VS Code           | Any recent version                      |
+| Cline             | VS Code extension                       |
+| websocket-client  | Python package, install via pip         |
+| DeepSeek account  | Registered at chat.deepseek.com         |
+
+## Installation
+
+### 1. Check Python
+
+Open **PowerShell** and run:
+
+```powershell
+python --version
+```
+
+If you see `python is not recognized` — install Python from
+https://www.python.org/downloads/ and **tick the "Add python.exe to PATH"
+checkbox** during installation. Reopen PowerShell afterwards.
+
+### 2. Install websocket-client
+
+```powershell
+python -m pip install websocket-client
+```
+
+Verify:
+
+```powershell
+python -c "import websocket; print('ok')"
+```
+
+### 3. Clone the repo
+
+```powershell
+cd C:\Projects
+git clone https://github.com/halil13091979/deepseek-relay-cline.git
+cd deepseek-relay-cline
+```
+
+### 4. Create `start-chrome.bat`
+
+```bat
+@echo off
+set PROFILE=%~dp0chrome-profile
+set CHROME="C:\Program Files\Google\Chrome\Application\chrome.exe"
+
+if not exist %CHROME% (
+    set CHROME="C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+)
+
+start "" %CHROME% ^
+    --remote-debugging-port=9222 ^
+    --user-data-dir="%PROFILE%" ^
+    --no-first-run ^
+    --no-default-browser-check ^
+    https://chat.deepseek.com/
+```
+
+### 5. Create `start-relay.bat`
+
+```bat
+@echo off
+cd /d %~dp0
+python deepseek-relay.py
+pause
+```
+
+## First run
+
+Order matters: Chrome first, then relay, then Cline.
+
+### 1. Start Chrome
+
+Double-click `start-chrome.bat`.
+
+Chrome opens with a **separate profile** (folder `chrome-profile`) and the
+page `chat.deepseek.com`.
+
+**Log in to DeepSeek.** The profile will remember your session.
+
+### 2. Verify CDP works
+
+Open this URL in that same Chrome:
+
+```
+http://127.0.0.1:9222/json/list
+```
+
+You should see a JSON list of tabs. Look for `"url": "https://chat.deepseek.com/"`.
+
+### 3. Start the relay
+
+Double-click `start-relay.bat`. You should see:
+
+```
+======================================================================
+DeepSeek Windows Relay
+======================================================================
+Listening: http://127.0.0.1:8080
+Health:    http://127.0.0.1:8080/health
+Models:    http://127.0.0.1:8080/v1/models
+Chrome CDP: http://127.0.0.1:9222
+======================================================================
+```
+
+**Do not close this window.**
+
+### 4. Verify the relay
+
+Open in a browser:
+
+```
+http://127.0.0.1:8080/health
+```
+
+Expected:
+
+```json
+{"ok": true, "service": "deepseek-windows-relay"}
+```
+
+## Daily run
+
+```
+1. Double-click: start-chrome.bat     → Chrome + DeepSeek
+2. Double-click: start-relay.bat      → relay on 8080
+3. VS Code → Cline → Act mode
+4. Type your task
+5. Watch the relay window for logs
+```
+
+To stop: `Ctrl+C` in the relay window.
+
+## Cline setup
+
+One-time (settings persist).
+
+In Cline settings (gear icon → **API Configuration**):
+
+| Field         | Value                        |
+|---------------|------------------------------|
+| API Provider  | OpenAI Compatible            |
+| Base URL      | `http://127.0.0.1:8080`      |
+| API Key       | `sk-local` (any non-empty)   |
+| Model ID      | `deepseek-chat`              |
+| Mode          | **Act**                      |
+
+## Usage
+
+Switch to **Act mode** and give tasks as usual:
+
+```
+List files in the project root
+```
+
+```
+Read package.json and README.md, summarize the project
+```
+
+```
+Create src/hello.ts with a greeting function
+```
+
+## Health checks
+
+### Fast check
+
+```
+http://127.0.0.1:8080/health     → {"ok": true, ...}
+http://127.0.0.1:9222/json/list  → JSON list of tabs
+```
+
+### Full check (PowerShell)
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8080/health
+Invoke-RestMethod http://127.0.0.1:8080/v1/models
+Invoke-RestMethod http://127.0.0.1:9222/json/list | Select-Object -First 3
+python -c "import websocket; print('websocket ok')"
+python -m py_compile deepseek-relay.py
+```
+
+## Where to find logs
+
+**Relay logs:** in the `start-relay.bat` window. Everything is there:
+`FULL CLINE REQUEST`, `PROMPT TO DEEPSEEK`, `ANSWER: '...'`, `TOOL CALLS`,
+`[HTTP] streamed answer`.
+
+To also write to a file, change `start-relay.bat` to:
+
+```bat
+python deepseek-relay.py >> relay.log 2>&1
+```
+
+**Cline logs:** in the Cline panel, click **"..."** → **"Open Logs"**.
+
+## Useful commands
+
+### Git
+
+```powershell
+cd C:\Projects\deepseek-relay
+git status                          # what changed
+git diff                            # exact diff
+git add .                           # stage all
+git commit -m "message"             # commit
+git push                            # upload
+git pull                            # download
+git log --oneline                   # commit history
+git remote -v                       # remotes
+git checkout -- file.txt            # discard local changes to a file
+```
+
+### Python
+
+```powershell
+python --version
+python -c "import websocket; print('ok')"
+python -m py_compile deepseek-relay.py
+python deepseek-relay.py            # run manually
+python -m pip install --upgrade websocket-client
+python -m pip list
+```
+
+### Network / ports
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8080/health
+Invoke-RestMethod http://127.0.0.1:9222/json/list
+netstat -ano | findstr :8080
+netstat -ano | findstr :9222
+taskkill /F /PID <pid>
+```
+
+### Processes
+
+```powershell
+Get-Process python
+taskkill /F /IM python.exe          # kill all python processes
+Get-Process chrome
+```
+
+### Chrome
+
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" `
+    --remote-debugging-port=9222 `
+    --user-data-dir="C:\Projects\deepseek-relay\chrome-profile" `
+    --no-first-run `
+    --no-default-browser-check `
+    https://chat.deepseek.com/
+
+Get-Command chrome.exe -ErrorAction SilentlyContinue
+Test-Path "C:\Program Files\Google\Chrome\Application\chrome.exe"
+```
+
+## Troubleshooting
+
+### Python
+
+**`python is not recognized`** — install Python with the PATH checkbox ticked,
+reopen PowerShell.
+
+**`ModuleNotFoundError: No module named 'websocket'`** —
+`python -m pip install websocket-client`
+
+**`SyntaxError: invalid syntax` in `py_compile`** — file damaged, re-download
+or paste it again.
+
+### Chrome / CDP
+
+**`Не найден открытый DeepSeek в Chrome`** — Chrome wasn't started with
+`--remote-debugging-port=9222`, or the DeepSeek tab isn't open, or the CDP
+profile isn't logged in. Fully close Chrome, run `start-chrome.bat`, log in.
+
+**`http://127.0.0.1:9222/json/list` doesn't open** — same reason.
+
+**`CDP websocket error`** — Chrome crashed or hung. Restart Chrome and relay.
+
+### Relay
+
+**`Address already in use`** — old relay still running. Close its window or
+`taskkill /F /IM python.exe`.
+
+**`Connection refused` in Cline** — relay not running. Start `start-relay.bat`.
+
+**500 / error** — check relay log; there will be an `[ERROR] ...` line.
+
+### Cline / DeepSeek
+
+**DeepSeek replies with plain text instead of a tool call** — happens on long
+context. Start a new chat in DeepSeek (close and reopen the tab).
+
+**`TOOL CALLS` present but Cline doesn't execute** — check the relay log.
+Possibly the Cline version doesn't accept our format.
+
+**Cline stuck on "Thinking…"** — DeepSeek still processing (10–60 s).
+If longer — check relay log for `Completion timeout`.
+
+## Updating the relay
+
+```powershell
+cd C:\Projects\deepseek-relay
+git pull
+python -m py_compile deepseek-relay.py
+```
+
+Stop the relay (`Ctrl+C`), start it again. Chrome doesn't need a restart.
+
+## Project structure
+
+```
+deepseek-relay/
+├── deepseek-relay.py        main relay code (~1500 lines)
+├── start-chrome.bat         launch Chrome with CDP profile
+├── start-relay.bat          launch the relay
+├── README.md                this file
+├── .gitignore               what not to push
+└── chrome-profile/          separate Chrome profile (not in git!)
+    └── ...                  cookies, DeepSeek session
+```
+
+## Limitations
+
+- The relay is single-threaded at the CDP level: parallel requests to
+  DeepSeek are queued (`browser_lock`).
+- Text streaming is emulated (the answer is chunked), not real-time from
+  DeepSeek.
+- DeepSeek Web doesn't guarantee a stable response format — after UI updates
+  the parsers (`parse_sse`, `extract_tool_calls`) may need fixes.
+- Windows only (paths, PowerShell, `.bat`).
+- Chrome must be running in the background.
+- A live DeepSeek session in Chrome is required.
+
+## Disclaimer
+
+This project uses the **DeepSeek web UI through a browser**, not the official
+API. This may violate DeepSeek's terms of use. Use at your own risk, for
+personal experiments. Do not expose tokens or sessions publicly.
+
+## License
+
+MIT
+
+## Credits
+
+- [Cline](https://github.com/cline/cline) — VS Code coding agent extension
+- [DeepSeek](https://chat.deepseek.com) — model and web chat
+- [websocket-client](https://github.com/websocket-client/websocket-client) —
+  Python WebSocket client used for CDP
+
+---
+
+<a name="русский"></a>
+
+# Русский
+
 Локальный OpenAI-совместимый релей, который позволяет
 [Cline](https://github.com/cline/cline) в VS Code использовать
 **DeepSeek Web Chat** как backend для кодинг-агента через
@@ -9,8 +480,6 @@ Cline думает, что общается с обычным OpenAI-совме�
 в **Act mode**: читает файлы, запускает команды, редактирует код, ищет
 по проекту. А на другом конце — веб-версия DeepSeek, которая не даёт
 API-доступ напрямую.
-
----
 
 ## Содержание
 
@@ -34,8 +503,6 @@ API-доступ напрямую.
 - [Лицензия](#лицензия)
 - [Благодарности](#благодарности)
 
----
-
 ## Зачем это нужно
 
 DeepSeek Web Chat хорош как модель, но у него нет публичного API для
@@ -57,8 +524,6 @@ DeepSeek Web Chat хорош как модель, но у него нет пуб
 
 > **DeepSeek планирует → Cline выполняет → результат возвращается → DeepSeek планирует следующий шаг.**
 
----
-
 ## Как это работает
 
 ```
@@ -74,7 +539,7 @@ DeepSeek Web Chat хорош как модель, но у него нет пуб
                     └──────────────────┘   (через Cline, не через релей)
 ```
 
-**Пошагово:**
+Пошагово:
 
 1. Cline отправляет HTTP POST на `http://127.0.0.1:8080/v1/chat/completions`
    с сообщениями и списком инструментов в формате OpenAI.
@@ -94,8 +559,6 @@ DeepSeek Web Chat хорош как модель, но у него нет пуб
 Релей **не выполняет** инструменты сам — этим занимается Cline. Релей только
 переводит сообщения между форматом OpenAI и текстовым протоколом DeepSeek Web.
 
----
-
 ## Возможности
 
 - OpenAI-совместимый endpoint `/v1/chat/completions`
@@ -109,8 +572,6 @@ DeepSeek Web Chat хорош как модель, но у него нет пуб
 - Устойчивость к обрывам соединения со стороны клиента
 - Логирование всего цикла: запрос Cline → промпт → ответ DeepSeek → вызов инструмента
 
----
-
 ## Требования
 
 | Компонент        | Версия / примечание                              |
@@ -123,27 +584,20 @@ DeepSeek Web Chat хорош как модель, но у него нет пуб
 | websocket-client | Python-пакет, ставится через pip                 |
 | Аккаунт DeepSeek | Зарегистрированный на chat.deepseek.com          |
 
----
-
 ## Установка
 
 ### Шаг 1. Проверь Python
 
-Открой **PowerShell** (Win+R → `powershell` → Enter) и выполни:
+Открой **PowerShell** и выполни:
 
 ```powershell
 python --version
 ```
 
-Должно вывести что-то вроде `Python 3.11.5`.
-
-**Если пишет «python не является внутренней или внешней командой»:**
-
-- Python не установлен, или не прописан в PATH.
-- Скачай с https://www.python.org/downloads/ и при установке **обязательно**
-  отметь галочку **"Add python.exe to PATH"**.
-- После установки закрой и открой PowerShell заново.
-- Проверь ещё раз.
+**Если пишет «python не является внутренней или внешней командой»** —
+скачай с https://www.python.org/downloads/ и при установке отметь
+**"Add python.exe to PATH"**. После установки закрой и открой PowerShell
+заново.
 
 ### Шаг 2. Установи websocket-client
 
@@ -157,8 +611,6 @@ python -m pip install websocket-client
 python -c "import websocket; print('ok')"
 ```
 
-Должно вывести `ok`.
-
 ### Шаг 3. Клонируй репозиторий
 
 ```powershell
@@ -167,15 +619,7 @@ git clone https://github.com/halil13091979/deepseek-relay-cline.git
 cd deepseek-relay-cline
 ```
 
-Если Git не установлен — качай с https://git-scm.com/download/win
-и при установке выбери **"Git from the command line and also from 3rd-party software"**.
-
-Если не хочешь клонировать — просто скачай ZIP с GitHub и распакуй в
-`C:\Projects\deepseek-relay`.
-
 ### Шаг 4. Создай `start-chrome.bat`
-
-В папке проекта создай файл `start-chrome.bat` (через Notepad или VS Code):
 
 ```bat
 @echo off
@@ -194,21 +638,6 @@ start "" %CHROME% ^
     https://chat.deepseek.com/
 ```
 
-**Если Chrome установлен в другом месте** — проверь путь:
-
-```powershell
-Test-Path "C:\Program Files\Google\Chrome\Application\chrome.exe"
-Test-Path "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
-```
-
-Тот, что вернёт `True` — тот и есть. Если оба `False` — найди Chrome:
-
-```powershell
-Get-Command chrome.exe -ErrorAction SilentlyContinue
-```
-
-Или запусти Chrome, открой `chrome://version` — там будет `Path` к exe.
-
 ### Шаг 5. Создай `start-relay.bat`
 
 ```bat
@@ -218,48 +647,31 @@ python deepseek-relay.py
 pause
 ```
 
-`pause` в конце — чтобы окно не закрылось, если релей упадёт с ошибкой.
-
----
-
 ## Первый запуск
 
 Порядок важен: сначала Chrome, потом релей, потом Cline.
 
 ### 1. Запусти Chrome
 
-Двойной клик по `start-chrome.bat`.
+Двойной клик по `start-chrome.bat`. Откроется Chrome с **отдельным
+профилем** (папка `chrome-profile`) и страницей `chat.deepseek.com`.
 
-Откроется окно Chrome с **отдельным профилем** (папка `chrome-profile` в
-проекте) и страницей https://chat.deepseek.com/.
-
-**Залогинься в DeepSeek.** Введи логин/пароль, пройди капчу если есть.
-После успешного входа профиль запомнит сессию — дальше логиниться не надо.
-
-> **Важно:** это **отдельный** профиль Chrome, не твой обычный. Там нет
-> твоих закладок, расширений и истории. Это нормально — так надо, чтобы
-> CDP-режим не мешал обычному Chrome.
+**Залогинься в DeepSeek.** Профиль запомнит сессию.
 
 ### 2. Проверь, что CDP работает
 
-В том же Chrome открой новую вкладку и перейди по адресу:
+Открой в том же Chrome:
 
 ```
 http://127.0.0.1:9222/json/list
 ```
 
-Должен вернуться JSON со списком вкладок. Найди там блок с
-`"url": "https://chat.deepseek.com/"` — значит всё в порядке.
-
-Если страница не открывается или пишет «Не удаётся получить доступ к сайту» —
-значит Chrome запущен **без** флага `--remote-debugging-port=9222`.
-Полностью закрой все окна Chrome и запусти снова через `start-chrome.bat`.
+Должен вернуться JSON со списком вкладок. Найди
+`"url": "https://chat.deepseek.com/"`.
 
 ### 3. Запусти релей
 
-Двойной клик по `start-relay.bat`.
-
-Должно появиться:
+Двойной клик по `start-relay.bat`. Должно появиться:
 
 ```
 ======================================================================
@@ -272,74 +684,37 @@ Chrome CDP: http://127.0.0.1:9222
 ======================================================================
 ```
 
-**Окно не закрывай.** Свернуть можно. Закрыть = остановить релей.
+**Окно не закрывай.**
 
-### 4. Проверь, что релей отвечает
+### 4. Проверь релей
 
-Открой **второй** PowerShell (первый занят релеем) и выполни:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8080/health
-```
-
-Должно вывести:
-
-```
-ok     service
---     -------
-True   deepseek-windows-relay
-```
-
-Или открой в браузере:
+Открой в браузере:
 
 ```
 http://127.0.0.1:8080/health
 ```
 
-Должно вернуть:
+Ожидается:
 
 ```json
 {"ok": true, "service": "deepseek-windows-relay"}
 ```
 
----
-
 ## Ежедневный запуск
 
-После первой настройки каждый раз делаешь одно и то же:
-
 ```
-1. Двойной клик: start-chrome.bat         → Chrome + DeepSeek
-2. Двойной клик: start-relay.bat          → релей на 8080
+1. Двойной клик: start-chrome.bat     → Chrome + DeepSeek
+2. Двойной клик: start-relay.bat      → релей на 8080
 3. VS Code → Cline → Act mode
 4. Пишешь задачу
 5. Смотришь в окно релея — там весь лог
 ```
 
-Остановка:
-
-```
-1. В окне релея — Ctrl+C
-2. Chrome с CDP-профилем можно закрывать
-```
-
-Порядок **важен**: если запустить релей **раньше** Chrome, он упадёт с ошибкой
-`Не найден открытый DeepSeek в Chrome`. В этом случае просто запусти Chrome
-и перезапусти релей.
-
----
+Остановка: `Ctrl+C` в окне релея.
 
 ## Настройка Cline
 
-Один раз (потом настройки сохраняются).
-
-### 1. Открой настройки Cline
-
-1. Открой VS Code.
-2. Открой панель Cline (иконка на левой панели, или `Ctrl+Shift+P` → `Cline: Open`).
-3. Нажми иконку **шестерёнки** (⚙) в верхней части панели Cline.
-
-### 2. Заполни поля
+Один раз в настройках Cline (шестерёнка → **API Configuration**):
 
 | Поле          | Значение                     |
 |---------------|------------------------------|
@@ -349,23 +724,9 @@ http://127.0.0.1:8080/health
 | Model ID      | `deepseek-chat`              |
 | Mode          | **Act**                      |
 
-### 3. Включи Act mode
-
-В верхней части панели Cline есть переключатель **Plan / Act**.
-Нажми **Act**. Должно стать:
-
-```
-Act
-```
-
----
-
 ## Использование
 
-Переключись в **Act mode** и давай задачи как обычно — на русском или
-английском, неважно.
-
-### Простые задачи
+Переключись в **Act mode** и давай задачи как обычно:
 
 ```
 Покажи список файлов в корне проекта
@@ -376,264 +737,90 @@ Act
 ```
 
 ```
-Сколько строк в deepseek-relay.py?
-```
-
-### Средние задачи
-
-```
 Создай файл src/hello.ts с функцией приветствия
 ```
 
-```
-Найди все места, где используется переменная CDP_URL, и покажи их
-```
-
-```
-Добавь в README.md раздел "Примеры использования"
-```
-
-### Сложные задачи
-
-```
-Прочитай package.json, найди все зависимости, сгруппируй их по типу
-(prod/dev) и сохрани отчёт в dependencies.md
-```
-
-```
-Прогони npm test, покажи ошибки, если есть — предложи исправления
-```
-
-Cline будет вызывать инструменты, релей — прокидывать их в DeepSeek, и
-цикл будет повторяться, пока задача не завершится.
-
----
-
 ## Проверка работоспособности
 
-### Быстрая проверка (30 секунд)
+### Быстрая проверка
 
-Открой в браузере два адреса:
+```
+http://127.0.0.1:8080/health     → {"ok": true, ...}
+http://127.0.0.1:9222/json/list  → JSON со списком вкладок
+```
 
-1. **Релей жив?**
-
-   ```
-   http://127.0.0.1:8080/health
-   ```
-
-   Ожидается:
-
-   ```json
-   {"ok": true, "service": "deepseek-windows-relay"}
-   ```
-
-2. **Chrome CDP жив?**
-
-   ```
-   http://127.0.0.1:9222/json/list
-   ```
-
-   Ожидается JSON со списком вкладок. Найди там `"url": "https://chat.deepseek.com/"`.
-
-Если оба работают — запускай Cline и работай.
-
-### Полная проверка (через PowerShell)
+### Полная проверка (PowerShell)
 
 ```powershell
-# 1. Проверь health
 Invoke-RestMethod http://127.0.0.1:8080/health
-
-# 2. Проверь models
 Invoke-RestMethod http://127.0.0.1:8080/v1/models
-
-# 3. Проверь, что Chrome с CDP отвечает
 Invoke-RestMethod http://127.0.0.1:9222/json/list | Select-Object -First 3
-
-# 4. Проверь, что Python видит websocket-client
 python -c "import websocket; print('websocket ok')"
-
-# 5. Проверь синтаксис релея
 python -m py_compile deepseek-relay.py
 ```
 
-Если всё зелёное — релей готов к работе.
-
-### Проверка через Cline (финальная)
-
-1. Переключись в Cline на **Act mode**.
-2. Дай задачу:
-
-   ```
-   Покажи список файлов в корне проекта
-   ```
-
-3. Смотри в окно релея. Должно побежать:
-
-   ```
-   CDP connected: https://chat.deepseek.com/...
-   Textarea node: 123
-   Textarea injection result: {'length': 22xxx}
-   Using send button node: 456
-   Send click command: 9
-   Waiting for DeepSeek completion...
-   Completion request: 13208.xxx
-   Completion finished: 13208.xxx
-   Completion body received: 2348 bytes
-   ANSWER: '{"tool_call": {...}}'
-   TOOL CALLS: [...]
-   [HTTP] "POST /v1/chat/completions HTTP/1.1" 200 -
-   ```
-
-4. В Cline должен появиться результат — список файлов.
-
----
-
 ## Где смотреть логи
 
-### Логи релея
+**Логи релея:** в окне `start-relay.bat`. Там всё: `FULL CLINE REQUEST`,
+`PROMPT TO DEEPSEEK`, `ANSWER: '...'`, `TOOL CALLS`, `[HTTP] streamed answer`.
 
-Всё пишется **в окно `start-relay.bat`**. Открой его — там весь цикл:
-
-```
-FULL CLINE REQUEST       ← что прислал Cline
-PROMPT TO DEEPSEEK       ← что ушло в DeepSeek
-ANSWER: '...'            ← что ответил DeepSeek
-TOOL CALLS: [...]        ← распознанный вызов инструмента
-[HTTP] streamed answer   ← что ушло обратно в Cline
-```
-
-Если хочешь логировать в файл — в `start-relay.bat` замени:
-
-```bat
-python deepseek-relay.py
-```
-
-на:
+Чтобы писать ещё и в файл, замени в `start-relay.bat`:
 
 ```bat
 python deepseek-relay.py >> relay.log 2>&1
 ```
 
-Тогда лог будет и в окне, и в файле `relay.log` рядом с релеем.
-
-### Логи Cline
-
-В панели Cline нажми иконку **"..."** в правом верхнем углу → **"Open Logs"**.
-Или в VS Code: `Ctrl+Shift+P` → `Cline: Open Logs`.
-
-### Логи Chrome (если нужно)
-
-В Chrome с CDP-профилем открой:
-
-```
-chrome://version
-chrome://inspect
-```
-
-`chrome://inspect` покажет открытые CDP-таргеты.
-
----
+**Логи Cline:** в панели Cline нажми **"..."** → **"Open Logs"**.
 
 ## Полезные команды
 
 ### Git
 
 ```powershell
-# Перейти в папку проекта
 cd C:\Projects\deepseek-relay
-
-# Посмотреть статус (что изменилось)
-git status
-
-# Посмотреть, что именно изменилось в файлах
-git diff
-
-# Добавить все изменения
-git add .
-
-# Добавить конкретный файл
-git add README.md
-
-# Закоммитить
-git commit -m "Описание что сделал"
-
-# Отправить на GitHub
-git push
-
-# Скачать изменения с GitHub
-git pull
-
-# Посмотреть историю коммитов
-git log --oneline
-
-# Отменить изменения в файле (до последнего коммита)
-git checkout -- имя_файла
-
-# Посмотреть, какие remote привязаны
-git remote -v
+git status                          # что изменилось
+git diff                            # точный дифф
+git add .                           # добавить все
+git commit -m "сообщение"           # коммит
+git push                            # отправить
+git pull                            # скачать
+git log --oneline                   # история коммитов
+git remote -v                       # remote'ы
+git checkout -- file.txt            # отменить локальные правки
 ```
 
 ### Python
 
 ```powershell
-# Проверить версию
 python --version
-
-# Проверить, что websocket-client установлен
 python -c "import websocket; print('ok')"
-
-# Проверить синтаксис релея
 python -m py_compile deepseek-relay.py
-
-# Запустить релей (вручную, без .bat)
-python deepseek-relay.py
-
-# Обновить websocket-client
+python deepseek-relay.py            # запустить вручную
 python -m pip install --upgrade websocket-client
-
-# Посмотреть, что установлено
 python -m pip list
 ```
 
-### Сеть
+### Сеть и порты
 
 ```powershell
-# Проверить, что релей отвечает
 Invoke-RestMethod http://127.0.0.1:8080/health
-
-# Проверить, что Chrome CDP отвечает
 Invoke-RestMethod http://127.0.0.1:9222/json/list
-
-# Проверить, что порт 8080 занят (кто-то слушает)
 netstat -ano | findstr :8080
-
-# Проверить, что порт 9222 занят (Chrome CDP)
 netstat -ano | findstr :9222
-
-# Убить процесс на порту 8080 (взять PID из netstat выше)
-taskkill /F /PID ЗДЕСЬ_PID
+taskkill /F /PID <pid>
 ```
 
 ### Процессы
 
 ```powershell
-# Посмотреть все Python-процессы
 Get-Process python
-
-# Убить все Python-процессы (закроет релей)
-taskkill /F /IM python.exe
-
-# Посмотреть все процессы Chrome
+taskkill /F /IM python.exe          # убить все Python-процессы
 Get-Process chrome
-
-# Найти окно релея (если потерял)
-Get-Process | Where-Object { $_.MainWindowTitle -like "*DeepSeek*" }
 ```
 
 ### Chrome
 
 ```powershell
-# Запустить Chrome с CDP вручную (если .bat не работает)
 & "C:\Program Files\Google\Chrome\Application\chrome.exe" `
     --remote-debugging-port=9222 `
     --user-data-dir="C:\Projects\deepseek-relay\chrome-profile" `
@@ -641,155 +828,54 @@ Get-Process | Where-Object { $_.MainWindowTitle -like "*DeepSeek*" }
     --no-default-browser-check `
     https://chat.deepseek.com/
 
-# Проверить, где установлен Chrome
 Get-Command chrome.exe -ErrorAction SilentlyContinue
 Test-Path "C:\Program Files\Google\Chrome\Application\chrome.exe"
-Test-Path "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
 ```
-
-### Обновление релея
-
-```powershell
-# Остановить релей (Ctrl+C в его окне)
-# Заменить deepseek-relay.py на новую версию
-# Проверить синтаксис
-python -m py_compile deepseek-relay.py
-# Запустить
-.\start-relay.bat
-```
-
----
 
 ## Частые проблемы
 
 ### Python
 
-**`python не является внутренней или внешней командой`**
+**`python не является внутренней или внешней командой`** — установи Python
+с галочкой PATH, перезапусти PowerShell.
 
-Python не установлен или не прописан в PATH.
+**`ModuleNotFoundError: No module named 'websocket'`** —
+`python -m pip install websocket-client`
 
-- Переустанови Python с https://www.python.org/downloads/
-- При установке отметь **"Add python.exe to PATH"**
-- Закрой и открой PowerShell заново
-
-**`ModuleNotFoundError: No module named 'websocket'`**
-
-```powershell
-python -m pip install websocket-client
-```
-
-**`SyntaxError: invalid syntax` при `py_compile`**
-
-Файл `deepseek-relay.py` повреждён или сохранён с ошибкой. Скачай заново с
-GitHub, либо скинь ошибку — разберём.
+**`SyntaxError: invalid syntax` при `py_compile`** — файл повреждён,
+скачай заново.
 
 ### Chrome / CDP
 
-**`Не найден открытый DeepSeek в Chrome`**
+**`Не найден открытый DeepSeek в Chrome`** — Chrome без
+`--remote-debugging-port=9222`, вкладка не открыта, или CDP-профиль
+не залогинен. Полностью закрой Chrome, запусти `start-chrome.bat`, залогинься.
 
-Причины и решения:
+**`http://127.0.0.1:9222/json/list` не открывается** — та же причина.
 
-1. Chrome запущен **без** `--remote-debugging-port=9222`.
-   - Полностью закрой **все** окна Chrome (проверь в трее).
-   - Запусти снова `start-chrome.bat`.
-2. Вкладка `chat.deepseek.com` не открыта.
-   - Открой её вручную.
-3. Ты залогинен в **другом** Chrome (обычном), а CDP-профиль пустой.
-   - В CDP-профиле залогинься заново.
-
-**`http://127.0.0.1:9222/json/list` не открывается**
-
-То же самое — Chrome без флага `--remote-debugging-port`. Полностью закрой
-Chrome, запусти через `start-chrome.bat`.
-
-**Chrome не запускается через `start-chrome.bat`**
-
-Проверь путь к Chrome:
-
-```powershell
-Test-Path "C:\Program Files\Google\Chrome\Application\chrome.exe"
-```
-
-Если `False` — найди Chrome и поправь путь в `start-chrome.bat`.
-
-**`CDP websocket error` в логах релея**
-
-Chrome с CDP закрылся или завис. Закрой Chrome, запусти `start-chrome.bat`,
-перезапусти релей.
+**`CDP websocket error`** — Chrome упал или завис. Перезапусти Chrome и релей.
 
 ### Релей
 
-**`Address already in use` / `порт 8080 занят`**
+**`Address already in use`** — старый релей не убит. Закрой окно или
+`taskkill /F /IM python.exe`.
 
-Старый релей не убит. Закрой все окна `start-relay.bat` или:
+**`Connection refused` в Cline** — релей не запущен. Запусти `start-relay.bat`.
 
-```powershell
-taskkill /F /IM python.exe
-```
-
-⚠️ Убьёт **все** Python-процессы.
-
-**`Connection refused` в Cline**
-
-Релей не запущен или упал. Проверь окно `start-relay.bat`. Если закрылось —
-открой заново.
-
-**Релей выдаёт 500 / ошибку**
-
-Смотри лог — там будет `[ERROR] ...` с конкретной причиной. Скинь эту
-строку.
-
-**Релей запустился, но `http://127.0.0.1:8080/health` не открывается**
-
-Проверь, что порт занят:
-
-```powershell
-netstat -ano | findstr :8080
-```
-
-Если ничего не выводит — релей не слушает. Перезапусти.
+**500 / ошибка** — смотри лог релея, там будет `[ERROR] ...`.
 
 ### Cline / DeepSeek
 
-**DeepSeek отвечает текстом вместо вызова инструмента**
+**DeepSeek отвечает текстом вместо tool call** — бывает на длинном контексте.
+Начни новый чат в DeepSeek (закрой и открой вкладку).
 
-Бывает на длинном контексте — модель «забывает» формат.
+**`TOOL CALLS` есть, но Cline не выполняет** — проверь лог релея. Возможно,
+версия Cline не принимает наш формат.
 
-Решения:
-
-1. Начни новый чат в DeepSeek — закрой и открой вкладку `chat.deepseek.com`.
-2. Переформулируй задачу проще.
-3. Перезапусти релей.
-
-В логе релея это видно как `TOOL CALLS: []` или
-`Ignoring unknown tool call: ...`.
-
-**`TOOL CALLS` есть, но Cline не выполняет команду**
-
-Смотри, приходит ли в Cline ответ с `finish_reason: "tool_calls"`. Если Cline
-показывает JSON как текст — возможно, версия Cline не принимает наш формат.
-Скинь лог релея — разберём.
-
-**Cline зависает на «Thinking…»**
-
-- DeepSeek ещё обрабатывает запрос (может занять 10–60 секунд).
-- Если больше минуты — смотри лог релея. Возможно, `Completion timeout`.
-- Попробуй задачу попроще.
-
-**Cline показывает «Connection refused» или «Failed to connect»**
-
-Релей не запущен. Открой `start-relay.bat`.
-
-**Cline работает, но медленно**
-
-Нормально — каждый шаг это один round-trip до DeepSeek через CDP:
-10–30 секунд на шаг. На больших задачах может быть 5–10 минут.
-
----
+**Cline зависает на «Thinking…»** — DeepSeek ещё обрабатывает (10–60 сек).
+Если дольше — смотри лог на `Completion timeout`.
 
 ## Как обновлять релей
-
-Если у тебя локально есть папка проекта с git:
 
 ```powershell
 cd C:\Projects\deepseek-relay
@@ -797,18 +883,7 @@ git pull
 python -m py_compile deepseek-relay.py
 ```
 
-Если файл обновился — останови релей (Ctrl+C в его окне) и запусти заново:
-
-```powershell
-.\start-relay.bat
-```
-
-Chrome можно не перезапускать.
-
-Если git нет — скачай `deepseek-relay.py` с GitHub вручную, замени файл,
-проверь синтаксис, перезапусти релей.
-
----
+Останови релей (`Ctrl+C`), запусти заново. Chrome перезапускать не нужно.
 
 ## Структура проекта
 
@@ -823,18 +898,6 @@ deepseek-relay/
     └── ...                  cookie, сессия DeepSeek
 ```
 
-**Что где:**
-
-- `deepseek-relay.py` — вся логика: HTTP-сервер, CDP-клиент, парсинг SSE,
-  преобразование tool_calls.
-- `start-chrome.bat` — запускает Chrome с флагами
-  `--remote-debugging-port=9222` и `--user-data-dir=chrome-profile`.
-- `start-relay.bat` — запускает Python-релей.
-- `.gitignore` — исключает `chrome-profile/`, `__pycache__/`, `.venv/` и т.д.
-- `chrome-profile/` — **не коммитить**. Там cookie сессии DeepSeek.
-
----
-
 ## Ограничения
 
 - Релей однопоточный на уровне CDP: параллельные запросы к DeepSeek
@@ -847,9 +910,6 @@ deepseek-relay/
 - Работает только на Windows (пути, PowerShell, `.bat`).
 - Chrome должен быть запущен в фоне всё время работы.
 - Требуется активная сессия DeepSeek в Chrome (залогинен).
-- На длинных задачах DeepSeek может терять формат tool_call.
-
----
 
 ## Отказ от ответственности
 
@@ -858,13 +918,9 @@ API. Это может нарушать условия использовани�
 страх и риск, для личных экспериментов. Не выкладывай токены и сессии
 в публичный доступ.
 
----
-
 ## Лицензия
 
 MIT
-
----
 
 ## Благодарности
 
