@@ -1,0 +1,10 @@
+chrome-profile/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+*.log
